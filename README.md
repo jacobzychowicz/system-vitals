@@ -1,8 +1,6 @@
 # System Vitals
 
-Windows-focused CLI that surfaces host, CPU, memory, disk, and GPU metrics.
-The code is simple to serve as a foundation for learning
-DevOps, observability, and infrastructure tooling.
+CLI that surfaces host, CPU, memory, disk, and GPU metrics.
 
 ## Current Features
 - Hostname, OS version, and uptime
@@ -24,13 +22,3 @@ Run the CLI:
 ```
 python main.py
 ```
-
-Optional flags:
-- `--drive <LETTER>`: Drive letter for disk usage (e.g., `--drive D`).
-- `--interval <seconds>`: Sampling window for CPU utilization (default 0.3s).
-
-## Notes
-- NVIDIA metrics are collected via `nvidia-smi` when available, otherwise GPU
-  info falls back to model detection only.
-- CPU temperature on Windows is often unavailable; the CLI will show
-  `unavailable` when the OS does not expose it.
