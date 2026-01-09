@@ -1,2 +1,2 @@
 psutil>=5.9
-
+pythonnet>=3.0

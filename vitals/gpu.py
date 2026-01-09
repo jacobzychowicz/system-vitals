@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
+import urllib.error
+import urllib.request
+import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
 
 
@@ -19,6 +25,210 @@ def _safe_float(value: str) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _ensure_lhm_lib() -> Optional[Path]:
+    """Download and extract LibreHardwareMonitor portable build; return DLL path."""
+    cache_dir = Path.home() / ".system-vitals" / "lhm"
+    dll_path = cache_dir / "LibreHardwareMonitorLib.dll"
+    if dll_path.exists():
+        return dll_path
+    url = (
+        "https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/"
+        "releases/latest/download/LibreHardwareMonitor.zip"
+    )
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = cache_dir / "LibreHardwareMonitor.zip"
+        with urllib.request.urlopen(url, timeout=8) as resp, open(
+            zip_path, "wb"
+        ) as fh:
+            fh.write(resp.read())
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(cache_dir)
+        if dll_path.exists():
+            return dll_path
+    except Exception:
+        return None
+    return None
+
+
+def _ensure_pythonnet() -> bool:
+    """Ensure pythonnet is importable; attempt a quick pip install if missing."""
+    try:
+        import clr  # type: ignore
+        return True
+    except Exception:
+        pass
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "pythonnet>=3.0"],
+            capture_output=True,
+            check=False,
+            timeout=12,
+        )
+    except Exception:
+        return False
+    try:
+        import clr  # type: ignore
+        return True
+    except Exception:
+        return False
+
+
+def _query_lhm_clr() -> Optional[GpuInfo]:
+    """Use LibreHardwareMonitorLib via pythonnet to read GPU metrics."""
+    if not _ensure_pythonnet():
+        return None
+    import clr  # type: ignore
+
+    dll_path = _ensure_lhm_lib()
+    if not dll_path:
+        return None
+
+    try:
+        clr.AddReference(str(dll_path))
+        from LibreHardwareMonitor import Hardware  # type: ignore
+    except Exception:
+        return None
+
+    computer = None
+    try:
+        computer = Hardware.Computer()
+        computer.IsGpuEnabled = True
+        computer.Open()
+        for hw in computer.Hardware:
+            hw.Update()
+            if hw.HardwareType not in (
+                Hardware.HardwareType.GpuNvidia,
+                Hardware.HardwareType.GpuAmd,
+                Hardware.HardwareType.GpuIntel,
+            ):
+                continue
+            model = hw.Name or "unknown GPU"
+            temp = None
+            util = None
+            mem_used = None
+            mem_total = None
+            for sensor in hw.Sensors:
+                stype = sensor.SensorType
+                name = (sensor.Name or "").lower()
+                value = sensor.Value
+                if value is None:
+                    continue
+                if stype == Hardware.SensorType.Temperature:
+                    # Prefer hotspot/core, otherwise first temp.
+                    if temp is None or any(tag in name for tag in ("hotspot", "core", "edge", "gpu")):
+                        temp = float(value)
+                elif stype == Hardware.SensorType.Load:
+                    if util is None or "core" in name or "gpu" in name:
+                        util = float(value)
+                elif stype == Hardware.SensorType.Data:
+                    if "memory used" in name or "dedicated memory used" in name:
+                        mem_used = float(value)
+                    if "memory total" in name or "dedicated memory total" in name:
+                        mem_total = float(value)
+            return GpuInfo(
+                model=model,
+                temperature_c=temp,
+                utilization_percent=util,
+                memory_used_mb=mem_used,
+                memory_total_mb=mem_total,
+            )
+    except Exception:
+        return None
+    finally:
+        try:
+            if computer is not None:
+                computer.Close()
+        except Exception:
+            pass
+    return None
+
+
+def _extract_lhm_json_gpu(node: dict) -> Optional[GpuInfo]:
+    """Walk LHM JSON to find first GPU with temp/util/memory."""
+    if not isinstance(node, dict):
+        return None
+    text = (node.get("Text") or "").lower()
+    sensor_type = (node.get("SensorType") or "").lower()
+    value = node.get("Value")
+    children = node.get("Children") or []
+
+    def to_float(val):
+        if val is None:
+            return None
+        try:
+            return float(str(val).split()[0])
+        except Exception:
+            return None
+
+    # Identify a GPU parent node
+    if "gpu" in text and "adapter" not in text:
+        temp = None
+        util = None
+        mem_used = None
+        mem_total = None
+        model = node.get("Text") or "GPU"
+        # Search children for sensors
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            if not isinstance(cur, dict):
+                continue
+            st = (cur.get("SensorType") or "").lower()
+            nm = (cur.get("Text") or "").lower()
+            val = cur.get("Value")
+            if st == "temperature":
+                if temp is None or any(tag in nm for tag in ("hotspot", "core", "edge", "gpu")):
+                    cand = to_float(val)
+                    if cand is not None:
+                        temp = cand
+            elif st == "load":
+                if util is None or "core" in nm or "gpu" in nm:
+                    cand = to_float(val)
+                    if cand is not None:
+                        util = cand
+            elif st == "data":
+                if "memory used" in nm or "dedicated memory used" in nm:
+                    cand = to_float(val)
+                    if cand is not None:
+                        mem_used = cand
+                if "memory total" in nm or "dedicated memory total" in nm:
+                    cand = to_float(val)
+                    if cand is not None:
+                        mem_total = cand
+            for child in cur.get("Children") or []:
+                stack.append(child)
+        return GpuInfo(
+            model=model,
+            temperature_c=temp,
+            utilization_percent=util,
+            memory_used_mb=mem_used,
+            memory_total_mb=mem_total,
+        )
+
+    for child in children:
+        found = _extract_lhm_json_gpu(child)
+        if found:
+            return found
+    return None
+
+
+def _query_lhm_http(url: str = "http://localhost:8085/data.json") -> Optional[GpuInfo]:
+    """Try reading GPU metrics from a running LibreHardwareMonitor HTTP server."""
+    try:
+        with urllib.request.urlopen(url, timeout=1.5) as resp:
+            content = resp.read()
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return None
+    except Exception:
+        return None
+    try:
+        data = json.loads(content.decode("utf-8", errors="ignore"))
+    except Exception:
+        return None
+    return _extract_lhm_json_gpu(data)
 
 
 def _query_nvidia_smi() -> List[GpuInfo]:
@@ -129,6 +339,14 @@ def get_gpu_info() -> Optional[GpuInfo]:
     nvidia_gpus = _query_nvidia_smi()
     if nvidia_gpus:
         return nvidia_gpus[0]
+
+    # Try LibreHardwareMonitor via embedded CLR (auto-download) and HTTP.
+    lhm_gpu = _query_lhm_clr()
+    if lhm_gpu:
+        return lhm_gpu
+    lhm_http_gpu = _query_lhm_http()
+    if lhm_http_gpu:
+        return lhm_http_gpu
 
     # Fall back to model-only detection.
     models = _query_wmic_models()
